@@ -11,6 +11,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
 import logging
+import random
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # Setup logging to file and console
 log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -34,15 +36,29 @@ SEARCH_URL = "https://www.nexxt-change.org/SiteGlobals/Forms/Verkaufsangebot_Suc
 output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(output_dir, exist_ok=True)
 
+# Configuration parameters
+MAX_RETRIES = 3
+PAGE_LOAD_TIMEOUT = 60
+ELEMENT_TIMEOUT = 30
+REQUEST_TIMEOUT = 180  # Increased from 120
+BETWEEN_REQUESTS_DELAY_MIN = 1
+BETWEEN_REQUESTS_DELAY_MAX = 3  # Random delay between requests
+
+def random_delay():
+    """Add a random delay between requests to avoid detection"""
+    delay = random.uniform(BETWEEN_REQUESTS_DELAY_MIN, BETWEEN_REQUESTS_DELAY_MAX)
+    logging.info(f"Waiting for {delay:.2f} seconds...")
+    time.sleep(delay)
+
 def handle_cookie_consent(driver):
     """Handle cookie consent popup if it appears"""
-    time.sleep(0.3)
+    random_delay()
     try:
         buttons = driver.find_elements(By.XPATH, "//button[contains(text(), 'Alle bestätigen')]")
         if buttons:
             driver.execute_script("arguments[0].click();", buttons[0])
             logging.info("Clicked cookie consent button")
-            time.sleep(0.2)
+            random_delay()
     except Exception as e:
         logging.error(f"Failed to click cookie button: {e}")
 
@@ -71,12 +87,12 @@ def extract_listing_info(driver, listing_url):
         data['id'] = id_match.group(1)
     
     try:
-        # Wait for main content to load
-        WebDriverWait(driver, 10).until(
+        # Wait for main content to load with increased timeout
+        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         
-        # Extract fields from the INSERAT section first (most reliable approach based on screenshots)
+        # Extract fields from the INSERAT section first
         try:
             # 1. Try direct targeting of the specific dt/dd elements in the INSERAT section
             inserat_dt_elements = driver.find_elements(By.CSS_SELECTOR, 
@@ -157,7 +173,7 @@ def extract_listing_info(driver, listing_url):
         except Exception as e:
             logging.error(f"Error extracting title: {e}")
         
-        # Extract description
+        # Extract description - look for the element with description content
         try:
             # First try to find elements with the class 'beschreibung'
             description_elements = driver.find_elements(By.XPATH, 
@@ -235,7 +251,7 @@ def extract_listing_info(driver, listing_url):
             except Exception as e:
                 logging.error(f"Error extracting {field}: {e}")
         
-        # Extract regionalpartner
+        # Extract regionalpartner - look for the section with REGIONALPARTNER heading
         try:
             regionalpartner_elements = driver.find_elements(By.XPATH, 
                 "//h3[contains(text(), 'REGIONALPARTNER')]/following-sibling::p[1] | " +
@@ -314,8 +330,8 @@ def get_listing_urls_from_page(driver):
     urls = []
     
     try:
-        # Wait for the page to load
-        WebDriverWait(driver, 10).until(
+        # Wait for the page to load with increased timeout
+        WebDriverWait(driver, ELEMENT_TIMEOUT).until(
             EC.presence_of_element_located((By.TAG_NAME, "a"))
         )
         
@@ -362,7 +378,7 @@ def navigate_to_next_page(driver, current_page):
     """Navigate to the next page of search results"""
     try:
         # Wait for the page to load completely
-        time.sleep(0.3)
+        random_delay()
         
         # First try the arrow/next button which is more reliable
         next_buttons = driver.find_elements(By.XPATH, 
@@ -373,9 +389,9 @@ def navigate_to_next_page(driver, current_page):
         if next_buttons and len(next_buttons) > 0:
             logging.info("Found next page arrow button, clicking...")
             driver.execute_script("arguments[0].scrollIntoView(true);", next_buttons[0])
-            time.sleep(0.1)
+            random_delay()
             driver.execute_script("arguments[0].click();", next_buttons[0])
-            time.sleep(0.5)  # Wait for page to load
+            random_delay()  # Wait for page to load
             logging.info(f"Navigated to next page using arrow")
             return True
             
@@ -396,9 +412,9 @@ def navigate_to_next_page(driver, current_page):
             if next_page_links and len(next_page_links) > 0:
                 logging.info(f"Found link to page {next_page_num}, clicking...")
                 driver.execute_script("arguments[0].scrollIntoView(true);", next_page_links[0])
-                time.sleep(0.1)
+                random_delay()
                 driver.execute_script("arguments[0].click();", next_page_links[0])
-                time.sleep(0.5)  # Wait for page to load
+                random_delay()  # Wait for page to load
                 logging.info(f"Navigated to page {next_page_num}")
                 return True
         
@@ -408,9 +424,9 @@ def navigate_to_next_page(driver, current_page):
             if element_with_next_page[0].is_displayed() and element_with_next_page[0].is_enabled():
                 logging.info(f"Found element with page number {next_page_num}, clicking...")
                 driver.execute_script("arguments[0].scrollIntoView(true);", element_with_next_page[0])
-                time.sleep(0.1)
+                random_delay()
                 driver.execute_script("arguments[0].click();", element_with_next_page[0])
-                time.sleep(0.5)  # Wait for page to load
+                random_delay()  # Wait for page to load
                 logging.info(f"Navigated to page {next_page_num}")
                 return True
         
@@ -423,6 +439,7 @@ def navigate_to_next_page(driver, current_page):
 
 def setup_chrome_driver():
     """Set up Chrome driver for a Linux server environment"""
+    logging.info("Setting up Chrome driver...")
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -430,18 +447,45 @@ def setup_chrome_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
-    # Additional options that might be needed on Digital Ocean
+    # Additional options for improving stability
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-infobars")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--disable-popup-blocking")
+    
+    # Increase timeouts
+    options.add_argument("--page-load-timeout=60000")
+    options.add_argument("--socket-timeout=60000")
+    
+    # Set a custom user agent to appear more like a regular browser
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
     
     # For Digital Ocean: Use the Chrome binary installed on the system
     # Make sure Chrome and chromedriver are installed and match versions
     chrome_service = Service('/usr/bin/chromedriver')  # Path to the installed chromedriver
     
     logging.info("Starting Chrome in headless mode...")
-    driver = webdriver.Chrome(service=chrome_service, options=options)
-    return driver
+    try:
+        driver = webdriver.Chrome(service=chrome_service, options=options)
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+        return driver
+    except Exception as e:
+        logging.error(f"Error creating WebDriver: {e}")
+        raise
+
+def run_with_retry(func, *args, **kwargs):
+    """Run a function with retry logic"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except (TimeoutException, WebDriverException) as e:
+            if attempt < MAX_RETRIES - 1:
+                logging.warning(f"Attempt {attempt+1} failed with error: {e}. Retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logging.error(f"All {MAX_RETRIES} attempts failed. Last error: {e}")
+                raise
 
 def run_scraper(max_pages=None):
     """
@@ -449,7 +493,7 @@ def run_scraper(max_pages=None):
     Will scrape until finding a listing older than 5 days (no page limit)
     """
     # Set up Chrome driver for Digital Ocean
-    driver = setup_chrome_driver()
+    driver = None
     
     # Track all extracted listings
     all_listings = []
@@ -459,10 +503,35 @@ def run_scraper(max_pages=None):
     found_old_listing = False
     
     try:
+        # Create browser with retry logic
+        for attempt in range(MAX_RETRIES):
+            try:
+                driver = setup_chrome_driver()
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    logging.warning(f"Attempt {attempt+1} to create driver failed: {e}. Retrying...")
+                    time.sleep(5)
+                else:
+                    logging.error(f"Failed to create Chrome driver after {MAX_RETRIES} attempts")
+                    raise
+        
         # Navigate to search page
         logging.info(f"Navigating to search page: {SEARCH_URL}")
-        driver.get(SEARCH_URL)
-        time.sleep(0.5)  # Wait for page to load
+        
+        # Open the URL with retry logic
+        for attempt in range(MAX_RETRIES):
+            try:
+                driver.get(SEARCH_URL)
+                random_delay()  # Wait for page to load
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    logging.warning(f"Attempt {attempt+1} to load search page failed: {e}. Retrying...")
+                    time.sleep(5)
+                else:
+                    logging.error(f"Failed to load search page after {MAX_RETRIES} attempts")
+                    raise
         
         # Handle cookie consent
         handle_cookie_consent(driver)
@@ -474,7 +543,7 @@ def run_scraper(max_pages=None):
         if search_buttons:
             logging.info("Found search button, clicking...")
             driver.execute_script("arguments[0].click();", search_buttons[0])
-            time.sleep(0.5)  # Wait for results to load
+            random_delay()  # Wait for results to load
             logging.info("Search executed")
         else:
             logging.error("No search button found!")
@@ -486,8 +555,20 @@ def run_scraper(max_pages=None):
         while max_pages is None or current_page <= max_pages:
             logging.info(f"\nProcessing search results page {current_page}")
             
+            # Save the current state after each page
+            if all_listings:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                temp_file = os.path.join(output_dir, f"nexxt_change_partial_{timestamp}.xlsx")
+                temp_df = pd.DataFrame(all_listings)
+                temp_df.to_excel(temp_file, index=False)
+                logging.info(f"Saved {len(all_listings)} listings to temporary file: {temp_file}")
+            
             # Get all listing URLs from this page
-            listing_urls = get_listing_urls_from_page(driver)
+            try:
+                listing_urls = run_with_retry(get_listing_urls_from_page, driver)
+            except Exception as e:
+                logging.error(f"Error getting listing URLs, trying to continue: {e}")
+                listing_urls = []
             
             # Process each listing
             for i, url in enumerate(listing_urls):
@@ -495,54 +576,118 @@ def run_scraper(max_pages=None):
                 logging.info(f"URL: {url}")
                 
                 # Open the listing in a new window
-                original_window = driver.current_window_handle
-                driver.execute_script(f"window.open('{url}', '_blank');")
-                
-                # Switch to the new window
-                windows = driver.window_handles
-                driver.switch_to.window(windows[-1])
-                
-                # Wait for page to load
-                time.sleep(0.5)
-                
-                # Handle cookie consent in the new window
-                handle_cookie_consent(driver)
-                
-                # Extract listing data
-                listing_data = extract_listing_info(driver, url)
-                
-                # Add to our collection
-                all_listings.append(listing_data)
-                
-                # Print info about what we found
-                logging.info(f"Extracted: {listing_data['title']}")
-                
-                # Check if the listing is older than five days
-                if listing_data['datum'] != "NA" and listing_data['datum'].strip():
+                try:
+                    original_window = driver.current_window_handle
+                    driver.execute_script(f"window.open('{url}', '_blank');")
+                    
+                    # Switch to the new window
+                    windows = driver.window_handles
+                    driver.switch_to.window(windows[-1])
+                    
+                    # Wait for page to load
+                    random_delay()
+                    
+                    # Handle cookie consent in the new window
+                    handle_cookie_consent(driver)
+                    
+                    # Extract listing data with retry
                     try:
-                        # Parse date in DD.MM.YYYY format
-                        listing_date = datetime.strptime(listing_data['datum'].strip(), "%d.%m.%Y")
-                        logging.info(f"Listing date: {listing_date.strftime('%d.%m.%Y')}, Cutoff date: {five_days_ago.strftime('%d.%m.%Y')}")
+                        listing_data = run_with_retry(extract_listing_info, driver, url)
+                    except Exception as e:
+                        logging.error(f"All retries failed to extract listing info: {e}")
+                        listing_data = {
+                            'id': "unknown",
+                            'url': url,
+                            'title': "ERROR",
+                            'beschreibung': "ERROR",
+                            'standort': "ERROR",
+                            'branche': "ERROR",
+                            'anzahl_mitarbeiter': "ERROR",
+                            'letzter_jahresumsatz': "ERROR",
+                            'preisvorstellung': "ERROR",
+                            'inseratstyp': "ERROR",
+                            'datum': "ERROR",
+                            'chiffre': "ERROR",
+                            'regionalpartner': "ERROR",
+                            'ansprechpartner': "ERROR",
+                        }
                         
-                        if listing_date < five_days_ago:
-                            logging.info(f"*** FOUND LISTING OLDER THAN FIVE DAYS: {listing_data['datum']} ***")
-                            logging.info(f"*** STOPPING SCRAPER AS REQUESTED ***")
-                            found_old_listing = True
+                        # Extract listing ID from URL if possible
+                        id_match = re.search(r'adId=(\d+)', url)
+                        if id_match:
+                            listing_data['id'] = id_match.group(1)
+                    
+                    # Add to our collection
+                    all_listings.append(listing_data)
+                    
+                    # Print info about what we found
+                    logging.info(f"Extracted: {listing_data['title']}")
+                    
+                    # Check if the listing is older than five days
+                    if listing_data['datum'] not in ["NA", "ERROR"] and listing_data['datum'].strip():
+                        try:
+                            # Parse date in DD.MM.YYYY format
+                            listing_date = datetime.strptime(listing_data['datum'].strip(), "%d.%m.%Y")
+                            logging.info(f"Listing date: {listing_date.strftime('%d.%m.%Y')}, Cutoff date: {five_days_ago.strftime('%d.%m.%Y')}")
                             
-                            # Close the listing window and switch back to search results
+                            if listing_date < five_days_ago:
+                                logging.info(f"*** FOUND LISTING OLDER THAN FIVE DAYS: {listing_data['datum']} ***")
+                                logging.info(f"*** STOPPING SCRAPER AS REQUESTED ***")
+                                found_old_listing = True
+                                
+                                # Close the listing window and switch back to search results
+                                driver.close()
+                                driver.switch_to.window(original_window)
+                                
+                                # Break out of the loop immediately
+                                break
+                        except Exception as date_error:
+                            logging.error(f"Error parsing date {listing_data['datum']}: {date_error}")
+                    
+                    # Only continue with the rest of the process if we haven't found an old listing
+                    if not found_old_listing:
+                        # Close the listing window and switch back to search results
+                        try:
                             driver.close()
                             driver.switch_to.window(original_window)
-                            
-                            # Break out of the loop immediately
+                        except Exception as window_error:
+                            logging.error(f"Error switching windows: {window_error}")
+                            # Try to recover by creating a new browser session
+                            try:
+                                driver.quit()
+                                driver = setup_chrome_driver()
+                                driver.get(SEARCH_URL)
+                                random_delay()
+                                handle_cookie_consent(driver)
+                                # Skip the rest of this page and continue with the next page
+                                break
+                            except Exception as recovery_error:
+                                logging.error(f"Failed to recover browser session: {recovery_error}")
+                                # If we can't recover, save what we have and exit
+                                found_old_listing = True
+                                break
+                except Exception as listing_error:
+                    logging.error(f"Error processing listing {url}: {listing_error}")
+                    try:
+                        # Try to switch back to the main window and continue
+                        windows = driver.window_handles
+                        driver.switch_to.window(windows[0])
+                    except Exception as switch_error:
+                        logging.error(f"Failed to switch back to main window: {switch_error}")
+                        # Try to recover by creating a new browser session
+                        try:
+                            driver.quit()
+                            driver = setup_chrome_driver()
+                            driver.get(SEARCH_URL)
+                            random_delay()
+                            handle_cookie_consent(driver)
+                            # Skip the rest of this page and continue with the next page
                             break
-                    except Exception as date_error:
-                        logging.error(f"Error parsing date {listing_data['datum']}: {date_error}")
-                
-                # Only continue with the rest of the process if we haven't found an old listing
-                if not found_old_listing:
-                    # Close the listing window and switch back to search results
-                    driver.close()
-                    driver.switch_to.window(original_window)
+                        except Exception as recovery_error:
+                            logging.error(f"Failed to recover browser session: {recovery_error}")
+                            # If we can't recover, save what we have and exit
+                            found_old_listing = True
+                            break
             
             # Stop if we found an old listing - check here to exit outer loop too
             if found_old_listing:
@@ -551,10 +696,17 @@ def run_scraper(max_pages=None):
                 
             # Move to the next page if needed
             if max_pages is None or current_page < max_pages:
-                if navigate_to_next_page(driver, current_page):
-                    current_page += 1
-                else:
-                    logging.info("Couldn't navigate to next page, ending search")
+                try:
+                    next_page_success = run_with_retry(navigate_to_next_page, driver, current_page)
+                    if next_page_success:
+                        current_page += 1
+                    else:
+                        logging.info("Couldn't navigate to next page, ending search")
+                        break
+                except Exception as nav_error:
+                    logging.error(f"Error navigating to next page: {nav_error}")
+                    # Try to recover and continue with what we have
+                    logging.info("Stopping page navigation due to error")
                     break
             else:
                 break
@@ -582,7 +734,11 @@ def run_scraper(max_pages=None):
     
     finally:
         # Always close the browser
-        driver.quit()
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
         logging.info("Scraper finished")
 
 if __name__ == "__main__":
