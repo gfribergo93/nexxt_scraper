@@ -1,0 +1,590 @@
+import time
+import re
+import os
+import sys
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from datetime import datetime
+import logging
+
+# Setup logging to file and console
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"nexxt_scraper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Search page URL
+SEARCH_URL = "https://www.nexxt-change.org/SiteGlobals/Forms/Verkaufsangebot_Suche/Verkaufsangebotssuche_Formular.html"
+
+# Output directory for results
+output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+os.makedirs(output_dir, exist_ok=True)
+
+def handle_cookie_consent(driver):
+    """Handle cookie consent popup if it appears"""
+    time.sleep(0.3)
+    try:
+        buttons = driver.find_elements(By.XPATH, "//button[contains(text(), 'Alle bestätigen')]")
+        if buttons:
+            driver.execute_script("arguments[0].click();", buttons[0])
+            logging.info("Clicked cookie consent button")
+            time.sleep(0.2)
+    except Exception as e:
+        logging.error(f"Failed to click cookie button: {e}")
+
+def extract_listing_info(driver, listing_url):
+    """Extract information from a single listing page"""
+    data = {
+        'id': "unknown",
+        'url': listing_url,
+        'title': "NA",
+        'beschreibung': "NA",
+        'standort': "NA",
+        'branche': "NA",
+        'anzahl_mitarbeiter': "NA",
+        'letzter_jahresumsatz': "NA",
+        'preisvorstellung': "NA",
+        'inseratstyp': "NA",
+        'datum': "NA",
+        'chiffre': "NA",
+        'regionalpartner': "NA",
+        'ansprechpartner': "NA",
+    }
+    
+    # Extract listing ID from URL
+    id_match = re.search(r'adId=(\d+)', listing_url)
+    if id_match:
+        data['id'] = id_match.group(1)
+    
+    try:
+        # Wait for main content to load
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        
+        # Extract fields from the INSERAT section first (most reliable approach based on screenshots)
+        try:
+            # 1. Try direct targeting of the specific dt/dd elements in the INSERAT section
+            inserat_dt_elements = driver.find_elements(By.CSS_SELECTOR, 
+                ".sidebar dt, .margin-details-zusatz-box dt")
+            
+            for dt in inserat_dt_elements:
+                try:
+                    label_text = dt.text.strip().lower()
+                    if "datum:" in label_text:
+                        dd = dt.find_element(By.XPATH, "following-sibling::dd[1]")
+                        data['datum'] = dd.text.strip()
+                        logging.info(f"Found date in sidebar dt/dd: {data['datum']}")
+                    elif "chiffre:" in label_text:
+                        dd = dt.find_element(By.XPATH, "following-sibling::dd[1]")
+                        data['chiffre'] = dd.text.strip()
+                        logging.info(f"Found chiffre in sidebar dt/dd: {data['chiffre']}")
+                    elif "inseratstyp:" in label_text:
+                        dd = dt.find_element(By.XPATH, "following-sibling::dd[1]")
+                        data['inseratstyp'] = dd.text.strip()
+                        logging.info(f"Found inseratstyp in sidebar dt/dd: {data['inseratstyp']}")
+                except Exception as dt_error:
+                    logging.error(f"Error processing dt element: {dt_error}")
+            
+            # 2. If the direct approach failed, try using the specific XPath from the screenshot
+            if data['datum'] == "NA":
+                date_specific_xpath = "//section[contains(@class, 'margin-details-zusatz-box')]//dt[text()='Datum:']/following-sibling::dd[1]"
+                date_elements = driver.find_elements(By.XPATH, date_specific_xpath)
+                if date_elements:
+                    data['datum'] = date_elements[0].text.strip()
+                    logging.info(f"Found date using specific XPath: {data['datum']}")
+                    
+            if data['chiffre'] == "NA":
+                chiffre_specific_xpath = "//section[contains(@class, 'margin-details-zusatz-box')]//dt[text()='Chiffre:']/following-sibling::dd[1]"
+                chiffre_elements = driver.find_elements(By.XPATH, chiffre_specific_xpath)
+                if chiffre_elements:
+                    data['chiffre'] = chiffre_elements[0].text.strip()
+                    logging.info(f"Found chiffre using specific XPath: {data['chiffre']}")
+                    
+            if data['inseratstyp'] == "NA":
+                typ_specific_xpath = "//section[contains(@class, 'margin-details-zusatz-box')]//dt[text()='Inseratstyp:']/following-sibling::dd[1]"
+                typ_elements = driver.find_elements(By.XPATH, typ_specific_xpath)
+                if typ_elements:
+                    data['inseratstyp'] = typ_elements[0].text.strip()
+                    logging.info(f"Found inseratstyp using specific XPath: {data['inseratstyp']}")
+        except Exception as inserat_error:
+            logging.error(f"Error extracting from INSERAT section: {inserat_error}")
+        
+        # Extract title - now properly targeting the h1 element
+        try:
+            # First look for h1 with main title content
+            title_element = None
+            
+            # Look for h1 in the main content area first (most reliable)
+            main_content_h1 = driver.find_elements(By.CSS_SELECTOR, 
+                ".tab-content .inserat-details-box h1, .inserat-details h1, .content-block h1")
+            
+            if main_content_h1:
+                title_element = main_content_h1[0]
+            else:
+                # Try to find any h1 that's not for navigation or accessibility
+                all_h1s = driver.find_elements(By.TAG_NAME, "h1")
+                for h1 in all_h1s:
+                    h1_text = h1.text.strip()
+                    # Filter out navigation elements or empty h1s
+                    if h1_text and "navigation" not in h1_text.lower() and "sronly" not in h1_text.lower():
+                        title_element = h1
+                        break
+            
+            if title_element:
+                data['title'] = title_element.text.strip()
+            else:
+                # Fallback: look for any prominent text that might be a title
+                potential_titles = driver.find_elements(By.CSS_SELECTOR, 
+                    "strong.title, .headline, .heading, .inserat-title, div.title")
+                
+                if potential_titles:
+                    data['title'] = potential_titles[0].text.strip()
+        except Exception as e:
+            logging.error(f"Error extracting title: {e}")
+        
+        # Extract description
+        try:
+            # First try to find elements with the class 'beschreibung'
+            description_elements = driver.find_elements(By.XPATH, 
+                "//div[contains(@class, 'beschreibung') or contains(@id, 'beschreibung')] | " +
+                "//h3[text()='Beschreibung']/following-sibling::*[1] | " +
+                "//div[text()='Beschreibung']/following-sibling::div[1]")
+            
+            if description_elements:
+                data['beschreibung'] = description_elements[0].text.strip()
+                logging.info(f"Found description in beschreibung element: {data['beschreibung'][:50]}...")
+            else:
+                # Try to find description content by looking for the heading followed by p tags
+                description_heading = driver.find_elements(By.XPATH, 
+                    "//h3[contains(text(), 'Beschreibung') or contains(text(), 'beschreibung')] | " +
+                    "//div[contains(text(), 'Beschreibung') or contains(text(), 'beschreibung')] | " +
+                    "//dt[contains(text(), 'Beschreibung')]")
+                
+                if description_heading:
+                    # Get all paragraph elements following the heading
+                    description_paragraphs = []
+                    current_element = description_heading[0]
+                    
+                    # Try to get the next few elements after the heading
+                    for _ in range(5):  # Try up to 5 next siblings
+                        try:
+                            next_sibling = driver.execute_script("""
+                                return arguments[0].nextElementSibling;
+                            """, current_element)
+                            
+                            if next_sibling:
+                                tag_name = driver.execute_script("return arguments[0].tagName.toLowerCase();", next_sibling)
+                                if tag_name in ['p', 'div', 'span'] and not "standort" in next_sibling.text.lower():
+                                    description_paragraphs.append(next_sibling.text.strip())
+                                elif tag_name in ['h3', 'h4'] or "standort" in next_sibling.text.lower():
+                                    # Stop when we hit another heading or standort section
+                                    break
+                                current_element = next_sibling
+                            else:
+                                break
+                        except Exception as inner_e:
+                            logging.error(f"Error getting next sibling: {inner_e}")
+                            break
+                    
+                    if description_paragraphs:
+                        data['beschreibung'] = '\n'.join(description_paragraphs)
+                        logging.info(f"Found description from paragraphs: {data['beschreibung'][:50]}...")
+                
+                # If still no description, try getting all text between Beschreibung and Standort
+                if data['beschreibung'] == "NA":
+                    page_text = driver.find_element(By.TAG_NAME, "body").text
+                    if "Beschreibung" in page_text and "Standort" in page_text:
+                        start_idx = page_text.find("Beschreibung") + len("Beschreibung")
+                        end_idx = page_text.find("Standort", start_idx)
+                        if end_idx > start_idx:
+                            data['beschreibung'] = page_text[start_idx:end_idx].strip()
+                            logging.info(f"Found description using text extraction: {data['beschreibung'][:50]}...")
+        except Exception as e:
+            logging.error(f"Error extracting description: {e}")
+        
+        # Extract field values using more reliable selectors
+        field_mappings = {
+            'standort': "//dt[contains(text(), 'Standort')]/following-sibling::dd[1] | //div[contains(text(), 'Standort')]/following-sibling::div[1] | //div[text()='Standort:']/following-sibling::div[1]",
+            'branche': "//dt[contains(text(), 'Branche')]/following-sibling::dd[1] | //div[contains(text(), 'Branche')]/following-sibling::div[1] | //div[text()='Branche:']/following-sibling::div[1]",
+            'anzahl_mitarbeiter': "//dt[contains(text(), 'Anzahl Mitarbeiter')]/following-sibling::dd[1] | //div[contains(text(), 'Anzahl Mitarbeiter')]/following-sibling::div[1] | //div[text()='Anzahl Mitarbeiter:']/following-sibling::div[1]",
+            'letzter_jahresumsatz': "//dt[contains(text(), 'Letzter Jahresumsatz')]/following-sibling::dd[1] | //div[contains(text(), 'Letzter Jahresumsatz')]/following-sibling::div[1] | //div[text()='Letzter Jahresumsatz:']/following-sibling::div[1]",
+            'preisvorstellung': "//dt[contains(text(), 'Preisvorstellung')]/following-sibling::dd[1] | //div[contains(text(), 'Preisvorstellung')]/following-sibling::div[1] | //div[text()='Preisvorstellung:']/following-sibling::div[1]",
+        }
+        
+        for field, xpath in field_mappings.items():
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                if elements:
+                    data[field] = elements[0].text.strip()
+                    logging.info(f"Found {field}: {data[field]}")
+            except Exception as e:
+                logging.error(f"Error extracting {field}: {e}")
+        
+        # Extract regionalpartner
+        try:
+            regionalpartner_elements = driver.find_elements(By.XPATH, 
+                "//h3[contains(text(), 'REGIONALPARTNER')]/following-sibling::p[1] | " +
+                "//h4[contains(text(), 'REGIONALPARTNER')]/following-sibling::p[1] | " +
+                "//h3[contains(text(), 'Regionalpartner')]/following-sibling::p[1] | " +
+                "//div[contains(@class, 'box-wrapper')]/p[1]")
+            
+            if regionalpartner_elements:
+                data['regionalpartner'] = regionalpartner_elements[0].text.strip()
+            else:
+                # Try to find it via the section heading
+                regional_sections = driver.find_elements(By.XPATH, 
+                    "//h3[contains(text(), 'REGIONALPARTNER')] | //h4[contains(text(), 'Regionalpartner')]")
+                if regional_sections:
+                    parent = regional_sections[0].find_element(By.XPATH, "./..")
+                    data['regionalpartner'] = parent.text.replace("REGIONALPARTNER", "").strip()
+        except Exception as e:
+            logging.error(f"Error extracting regionalpartner: {e}")
+        
+        # Extract ansprechpartner
+        try:
+            contact_elements = driver.find_elements(By.XPATH, 
+                "//h4[contains(text(), 'Ansprechpartner')]/following-sibling::p[1] | " +
+                "//h4[contains(text(), 'Ihre Ansprechpartnerin')]/following-sibling::p[1] | " +
+                "//div[contains(text(), 'Ihre Ansprechpartnerin')]/following-sibling::div[1]")
+            
+            if contact_elements:
+                data['ansprechpartner'] = contact_elements[0].text.strip()
+        except Exception as e:
+            logging.error(f"Error extracting ansprechpartner: {e}")
+        
+        # Last resort: try to extract missing fields from body text
+        if data['datum'] == "NA" or data['chiffre'] == "NA" or data['inseratstyp'] == "NA":
+            try:
+                page_text = driver.find_element(By.TAG_NAME, "body").text
+                
+                # Check for sections in the text
+                if "INSERAT" in page_text:
+                    inserat_text = page_text.split("INSERAT")[1]
+                    if "REGIONALPARTNER" in inserat_text:
+                        inserat_text = inserat_text.split("REGIONALPARTNER")[0]
+                    
+                    # Extract datum if still missing
+                    if data['datum'] == "NA" and "Datum:" in inserat_text:
+                        datum_text = inserat_text.split("Datum:")[1].strip()
+                        date_match = re.search(r'\d{2}\.\d{2}\.\d{4}', datum_text)
+                        if date_match:
+                            data['datum'] = date_match.group(0)
+                            logging.info(f"Found date via text extraction: {data['datum']}")
+                    
+                    # Extract chiffre if still missing
+                    if data['chiffre'] == "NA" and "Chiffre:" in inserat_text:
+                        chiffre_text = inserat_text.split("Chiffre:")[1].strip()
+                        if "\n" in chiffre_text:
+                            chiffre_text = chiffre_text.split("\n")[0].strip()
+                        data['chiffre'] = chiffre_text
+                        logging.info(f"Found chiffre via text extraction: {data['chiffre']}")
+                    
+                    # Extract inseratstyp if still missing
+                    if data['inseratstyp'] == "NA" and "Inseratstyp:" in inserat_text:
+                        typ_text = inserat_text.split("Inseratstyp:")[1].strip()
+                        if "\n" in typ_text:
+                            typ_text = typ_text.split("\n")[0].strip()
+                        data['inseratstyp'] = typ_text
+                        logging.info(f"Found inseratstyp via text extraction: {data['inseratstyp']}")
+            except Exception as e:
+                logging.error(f"Error in text extraction fallback: {e}")
+            
+    except Exception as e:
+        logging.error(f"Error in extract_listing_info: {e}")
+    
+    return data
+
+def get_listing_urls_from_page(driver):
+    """Extract all listing URLs from current search results page"""
+    urls = []
+    
+    try:
+        # Wait for the page to load
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "a"))
+        )
+        
+        # Try two different approaches to get listing links
+        
+        # 1. Find all link elements containing "Detailseite" and "adId"
+        links = driver.find_elements(By.XPATH, "//a[contains(@href, 'Detailseite') and contains(@href, 'adId')]")
+        
+        for link in links:
+            try:
+                href = link.get_attribute("href")
+                if href and href not in urls:
+                    urls.append(href)
+            except:
+                continue
+        
+        # 2. If we didn't find any links, try a more general approach with JavaScript
+        if not urls:
+            logging.info("Using JavaScript to find listing links")
+            urls = driver.execute_script("""
+                var links = document.getElementsByTagName('a');
+                var listingUrls = [];
+                
+                for (var i = 0; i < links.length; i++) {
+                    var href = links[i].href;
+                    if (href && href.includes('Detailseite') && href.includes('adId=')) {
+                        if (!listingUrls.includes(href)) {
+                            listingUrls.push(href);
+                        }
+                    }
+                }
+                
+                return listingUrls;
+            """)
+        
+        logging.info(f"Found {len(urls)} listing URLs on this page")
+        return urls
+        
+    except Exception as e:
+        logging.error(f"Error extracting listing URLs: {e}")
+        return []
+
+def navigate_to_next_page(driver, current_page):
+    """Navigate to the next page of search results"""
+    try:
+        # Wait for the page to load completely
+        time.sleep(0.3)
+        
+        # First try the arrow/next button which is more reliable
+        next_buttons = driver.find_elements(By.XPATH, 
+            "//a[contains(@class, 'next')] | //a[@aria-label='Next'] | " +
+            "//span[contains(@class, 'next')]/parent::a | " +
+            "//a[contains(@title, 'nächste')] | //a[contains(@title, 'Nächste')]")
+        
+        if next_buttons and len(next_buttons) > 0:
+            logging.info("Found next page arrow button, clicking...")
+            driver.execute_script("arguments[0].scrollIntoView(true);", next_buttons[0])
+            time.sleep(0.1)
+            driver.execute_script("arguments[0].click();", next_buttons[0])
+            time.sleep(0.5)  # Wait for page to load
+            logging.info(f"Navigated to next page using arrow")
+            return True
+            
+        # Second try: use the page numbers at the bottom
+        next_page_num = current_page + 1
+        
+        # Try multiple XPath patterns to find the numbered page links
+        xpath_patterns = [
+            f"//a[text()='{next_page_num}']",
+            f"//li[contains(@class, 'pagination-item')]/a[text()='{next_page_num}']",
+            f"//ul[contains(@class, 'pagination')]//a[text()='{next_page_num}']",
+            f"//div[contains(@class, 'pagination')]//a[text()='{next_page_num}']",
+            f"//nav//a[text()='{next_page_num}']"
+        ]
+        
+        for xpath in xpath_patterns:
+            next_page_links = driver.find_elements(By.XPATH, xpath)
+            if next_page_links and len(next_page_links) > 0:
+                logging.info(f"Found link to page {next_page_num}, clicking...")
+                driver.execute_script("arguments[0].scrollIntoView(true);", next_page_links[0])
+                time.sleep(0.1)
+                driver.execute_script("arguments[0].click();", next_page_links[0])
+                time.sleep(0.5)  # Wait for page to load
+                logging.info(f"Navigated to page {next_page_num}")
+                return True
+        
+        # Third try: look for any element that might contain the next page number
+        element_with_next_page = driver.find_elements(By.XPATH, f"//*[text()='{next_page_num}']")
+        if element_with_next_page and len(element_with_next_page) > 0:
+            if element_with_next_page[0].is_displayed() and element_with_next_page[0].is_enabled():
+                logging.info(f"Found element with page number {next_page_num}, clicking...")
+                driver.execute_script("arguments[0].scrollIntoView(true);", element_with_next_page[0])
+                time.sleep(0.1)
+                driver.execute_script("arguments[0].click();", element_with_next_page[0])
+                time.sleep(0.5)  # Wait for page to load
+                logging.info(f"Navigated to page {next_page_num}")
+                return True
+        
+        logging.info("No next page link or button found")
+        return False
+        
+    except Exception as e:
+        logging.error(f"Error navigating to next page: {e}")
+        return False
+
+def setup_chrome_driver():
+    """Set up Chrome driver for a Linux server environment"""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    
+    # Additional options that might be needed on Digital Ocean
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-infobars")
+    
+    # For Digital Ocean: Use the Chrome binary installed on the system
+    # Make sure Chrome and chromedriver are installed and match versions
+    chrome_service = Service('/usr/bin/chromedriver')  # Path to the installed chromedriver
+    
+    logging.info("Starting Chrome in headless mode...")
+    driver = webdriver.Chrome(service=chrome_service, options=options)
+    return driver
+
+def run_scraper(max_pages=None):
+    """
+    Run the complete scraper process
+    Will scrape until finding a listing older than 5 days (no page limit)
+    """
+    # Set up Chrome driver for Digital Ocean
+    driver = setup_chrome_driver()
+    
+    # Track all extracted listings
+    all_listings = []
+    
+    # Calculate the date five days ago for comparison
+    five_days_ago = datetime.now() - pd.Timedelta(days=5)
+    found_old_listing = False
+    
+    try:
+        # Navigate to search page
+        logging.info(f"Navigating to search page: {SEARCH_URL}")
+        driver.get(SEARCH_URL)
+        time.sleep(0.5)  # Wait for page to load
+        
+        # Handle cookie consent
+        handle_cookie_consent(driver)
+        
+        # Click the search button
+        search_buttons = driver.find_elements(By.XPATH, 
+            "//button[@type='submit' or contains(text(), 'Suchen')]")
+        
+        if search_buttons:
+            logging.info("Found search button, clicking...")
+            driver.execute_script("arguments[0].click();", search_buttons[0])
+            time.sleep(0.5)  # Wait for results to load
+            logging.info("Search executed")
+        else:
+            logging.error("No search button found!")
+            return
+        
+        # Process each page of results
+        current_page = 1
+        
+        while max_pages is None or current_page <= max_pages:
+            logging.info(f"\nProcessing search results page {current_page}")
+            
+            # Get all listing URLs from this page
+            listing_urls = get_listing_urls_from_page(driver)
+            
+            # Process each listing
+            for i, url in enumerate(listing_urls):
+                logging.info(f"\nProcessing listing {i+1}/{len(listing_urls)} on page {current_page}")
+                logging.info(f"URL: {url}")
+                
+                # Open the listing in a new window
+                original_window = driver.current_window_handle
+                driver.execute_script(f"window.open('{url}', '_blank');")
+                
+                # Switch to the new window
+                windows = driver.window_handles
+                driver.switch_to.window(windows[-1])
+                
+                # Wait for page to load
+                time.sleep(0.5)
+                
+                # Handle cookie consent in the new window
+                handle_cookie_consent(driver)
+                
+                # Extract listing data
+                listing_data = extract_listing_info(driver, url)
+                
+                # Add to our collection
+                all_listings.append(listing_data)
+                
+                # Print info about what we found
+                logging.info(f"Extracted: {listing_data['title']}")
+                
+                # Check if the listing is older than five days
+                if listing_data['datum'] != "NA" and listing_data['datum'].strip():
+                    try:
+                        # Parse date in DD.MM.YYYY format
+                        listing_date = datetime.strptime(listing_data['datum'].strip(), "%d.%m.%Y")
+                        logging.info(f"Listing date: {listing_date.strftime('%d.%m.%Y')}, Cutoff date: {five_days_ago.strftime('%d.%m.%Y')}")
+                        
+                        if listing_date < five_days_ago:
+                            logging.info(f"*** FOUND LISTING OLDER THAN FIVE DAYS: {listing_data['datum']} ***")
+                            logging.info(f"*** STOPPING SCRAPER AS REQUESTED ***")
+                            found_old_listing = True
+                            
+                            # Close the listing window and switch back to search results
+                            driver.close()
+                            driver.switch_to.window(original_window)
+                            
+                            # Break out of the loop immediately
+                            break
+                    except Exception as date_error:
+                        logging.error(f"Error parsing date {listing_data['datum']}: {date_error}")
+                
+                # Only continue with the rest of the process if we haven't found an old listing
+                if not found_old_listing:
+                    # Close the listing window and switch back to search results
+                    driver.close()
+                    driver.switch_to.window(original_window)
+            
+            # Stop if we found an old listing - check here to exit outer loop too
+            if found_old_listing:
+                logging.info("Breaking out of page processing as we found a listing older than five days")
+                break
+                
+            # Move to the next page if needed
+            if max_pages is None or current_page < max_pages:
+                if navigate_to_next_page(driver, current_page):
+                    current_page += 1
+                else:
+                    logging.info("Couldn't navigate to next page, ending search")
+                    break
+            else:
+                break
+        
+        # Save all extracted data to a single Excel file with timestamp
+        if all_listings:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = os.path.join(output_dir, f"nexxt_change_listings_{timestamp}.xlsx")
+            df = pd.DataFrame(all_listings)
+            df.to_excel(file_name, index=False)
+            logging.info(f"\nScraping completed. Extracted {len(all_listings)} listings.")
+            logging.info(f"Results saved to {file_name}")
+        else:
+            logging.info("No listings were found or extracted")
+            
+    except Exception as e:
+        logging.error(f"Error in main scraper process: {e}")
+        
+        # Try to save any data we've collected so far
+        if all_listings:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            error_file = os.path.join(output_dir, f"nexxt_change_error_{timestamp}.xlsx")
+            pd.DataFrame(all_listings).to_excel(error_file, index=False)
+            logging.info(f"Saved {len(all_listings)} listings to {error_file} before error")
+    
+    finally:
+        # Always close the browser
+        driver.quit()
+        logging.info("Scraper finished")
+
+if __name__ == "__main__":
+    # Run the scraper with no maximum page limit, will stop when finding a listing older than 5 days
+    run_scraper()
